@@ -80,9 +80,21 @@ locals {
           group_prefix   = pol.group_prefix
           source_address = pol.source_address
         }]
-        leaked_internal_prefixes = [for prefix in try(vrf.leaked_internal_prefixes, []) : {
+        leaked_internal_subnets = [for prefix in try(vrf.leaked_internal_subnets, []) : {
           prefix = prefix.prefix
-          public = try(prefix.public, local.defaults.apic.tenants.vrfs.leaked_internal_prefixes.public)
+          public = try(prefix.public, local.defaults.apic.tenants.vrfs.leaked_internal_subnets.public)
+          destinations = [for dest in try(prefix.destinations, []) : {
+            description = try(dest.description, "")
+            tenant      = dest.tenant
+            vrf         = dest.vrf
+            public      = try(dest.public, null)
+          }]
+        }]
+        leaked_internal_prefixes = [for prefix in try(vrf.leaked_internal_prefixes, []) : {
+          prefix             = prefix.prefix
+          public             = try(prefix.public, local.defaults.apic.tenants.vrfs.leaked_internal_prefixes.public)
+          from_prefix_length = try(prefix.from_prefix_length, null)
+          to_prefix_length   = try(prefix.to_prefix_length, null)
           destinations = [for dest in try(prefix.destinations, []) : {
             description = try(dest.description, "")
             tenant      = dest.tenant
@@ -170,6 +182,7 @@ module "aci_vrf" {
   pim_ssm_group_range_multicast_route_map  = each.value.pim_ssm_group_range_multicast_route_map
   pim_inter_vrf_policies                   = each.value.pim_inter_vrf_policies
   pim_igmp_ssm_translate_policies          = each.value.pim_igmp_ssm_translate_policies
+  leaked_internal_subnets                  = each.value.leaked_internal_subnets
   leaked_internal_prefixes                 = each.value.leaked_internal_prefixes
   leaked_external_prefixes                 = each.value.leaked_external_prefixes
   route_summarization_policies             = each.value.route_summarization_policies
@@ -216,6 +229,7 @@ locals {
         igmp_snooping_policy       = try("${bd.igmp_snooping_policy}${local.defaults.apic.tenants.policies.igmp_snooping_policies.name_suffix}", "")
         nd_interface_policy        = try("${bd.nd_interface_policy}${local.defaults.apic.tenants.policies.nd_interface_policies.name_suffix}", "")
         endpoint_retention_policy  = try("${bd.endpoint_retention_policy}${local.defaults.apic.tenants.policies.endpoint_retention_policies.name_suffix}", "")
+        legacy_mode_vlan           = try(bd.legacy_mode_vlan, null)
         subnets = [for subnet in try(bd.subnets, []) : {
           ip                    = subnet.ip
           description           = try(subnet.description, "")
@@ -275,6 +289,7 @@ module "aci_bridge_domain" {
   igmp_snooping_policy       = each.value.igmp_snooping_policy
   nd_interface_policy        = each.value.nd_interface_policy
   endpoint_retention_policy  = each.value.endpoint_retention_policy
+  legacy_mode_vlan           = each.value.legacy_mode_vlan
   subnets                    = each.value.subnets
   l3outs                     = each.value.l3outs
   dhcp_labels                = each.value.dhcp_labels
@@ -1033,7 +1048,6 @@ module "aci_l3out" {
     module.aci_ospf_interface_policy,
     module.aci_eigrp_interface_policy,
     module.aci_bfd_interface_policy,
-    module.aci_set_rule,
     module.aci_match_rule,
   ]
 }
@@ -2750,6 +2764,7 @@ module "aci_set_rule" {
 
   depends_on = [
     module.aci_tenant,
+    module.aci_external_endpoint_group,
   ]
 }
 
@@ -3487,7 +3502,6 @@ locals {
         concrete_devices = [for cdev in try(device.concrete_devices, []) : {
           name         = "${cdev.name}${local.defaults.apic.tenants.services.l4l7_devices.concrete_devices.name_suffix}"
           alias        = try(cdev.alias, null)
-          description  = try(cdev.description, null)
           vcenter_name = try(cdev.vcenter_name, null)
           vm_name      = try(cdev.vm_name, null)
           interfaces = [for int in try(cdev.interfaces, []) : {
@@ -3541,7 +3555,6 @@ module "aci_l4l7_device" {
   concrete_devices = [for cdev in try(each.value.concrete_devices, []) : {
     name         = cdev.name
     alias        = cdev.alias
-    description  = cdev.description
     vcenter_name = cdev.vcenter_name
     vm_name      = cdev.vm_name
     interfaces = [for int in try(cdev.interfaces, []) : {
@@ -3613,6 +3626,7 @@ locals {
         resilient_hashing      = try(policy.resilient_hashing, local.defaults.apic.tenants.services.redirect_policies.resilient_hashing)
         threshold_down_action  = try(policy.threshold_down_action, local.defaults.apic.tenants.services.redirect_policies.threshold_down_action)
         ip_sla_policy          = try("${policy.ip_sla_policy}${local.defaults.apic.tenants.policies.ip_sla_policies.name_suffix}", "")
+        ip_sla_policy_tenant   = !contains(try(local.tenant_shared_policies[tenant.name].ip_sla_policies, []), policy.ip_sla_policy) && contains(try(local.tenant_shared_policies["common"].ip_sla_policies, []), policy.ip_sla_policy) ? "common" : tenant.name
         redirect_backup_policy = try("${policy.redirect_backup_policy}${local.defaults.apic.tenants.services.redirect_backup_policies.name_suffix}", "")
         rewrite_source_mac     = try(policy.rewrite_source_mac, null)
         l3_destinations = [for dest in try(policy.l3_destinations, []) : {
@@ -3658,6 +3672,7 @@ module "aci_redirect_policy" {
   resilient_hashing      = each.value.resilient_hashing
   threshold_down_action  = each.value.threshold_down_action
   ip_sla_policy          = each.value.ip_sla_policy
+  ip_sla_policy_tenant   = each.value.ip_sla_policy_tenant
   redirect_backup_policy = each.value.redirect_backup_policy
   l3_destinations        = each.value.l3_destinations
   l1l2_destinations      = each.value.l1l2_destinations
@@ -4113,14 +4128,15 @@ locals {
     for tenant in local.tenants : concat(
       [
         for policy in try(tenant.policies.track_members, []) : {
-          key            = format("%s/%s", tenant.name, policy.name)
-          tenant         = tenant.name
-          name           = "${policy.name}${local.defaults.apic.tenants.policies.track_members.name_suffix}"
-          description    = try(policy.description, "")
-          destination_ip = policy.destination_ip
-          scope_type     = policy.scope_type
-          scope          = policy.scope
-          ip_sla_policy  = policy.ip_sla_policy
+          key                  = format("%s/%s", tenant.name, policy.name)
+          tenant               = tenant.name
+          name                 = "${policy.name}${local.defaults.apic.tenants.policies.track_members.name_suffix}"
+          description          = try(policy.description, "")
+          destination_ip       = policy.destination_ip
+          scope_type           = policy.scope_type
+          scope                = policy.scope
+          ip_sla_policy        = policy.ip_sla_policy
+          ip_sla_policy_tenant = !contains(try(local.tenant_shared_policies[tenant.name].ip_sla_policies, []), policy.ip_sla_policy) && contains(try(local.tenant_shared_policies["common"].ip_sla_policies, []), policy.ip_sla_policy) ? "common" : tenant.name
         }
       ],
       [
@@ -4130,14 +4146,15 @@ locals {
               for node in try(np.nodes, []) : [
                 for static_route in try(node.static_routes, []) : [
                   for next_hop in try(static_route.next_hops, []) : {
-                    key            = format("%s/%s_%s", tenant.name, "${l3out.vrf}${local.defaults.apic.tenants.vrfs.name_suffix}", next_hop.ip)
-                    tenant         = tenant.name
-                    name           = try("${l3out.vrf}${local.defaults.apic.tenants.vrfs.name_suffix}_${next_hop.ip}", null)
-                    description    = try("Generated by l3out: ${l3out.name}${local.defaults.apic.tenants.l3outs.name_suffix}, node: ${node.node_id}", "")
-                    destination_ip = try(next_hop.ip, null)
-                    scope_type     = "l3out"
-                    scope          = try("${l3out.name}${local.defaults.apic.tenants.l3outs.name_suffix}", "")
-                    ip_sla_policy  = try("${next_hop.ip_sla_policy}${local.defaults.apic.tenants.policies.ip_sla_policies.name_suffix}", null)
+                    key                  = format("%s/%s_%s", tenant.name, "${l3out.vrf}${local.defaults.apic.tenants.vrfs.name_suffix}", next_hop.ip)
+                    tenant               = tenant.name
+                    name                 = try("${l3out.vrf}${local.defaults.apic.tenants.vrfs.name_suffix}_${next_hop.ip}", null)
+                    description          = try("Generated by l3out: ${l3out.name}${local.defaults.apic.tenants.l3outs.name_suffix}, node: ${node.node_id}", "")
+                    destination_ip       = try(next_hop.ip, null)
+                    scope_type           = "l3out"
+                    scope                = try("${l3out.name}${local.defaults.apic.tenants.l3outs.name_suffix}", "")
+                    ip_sla_policy        = try("${next_hop.ip_sla_policy}${local.defaults.apic.tenants.policies.ip_sla_policies.name_suffix}", null)
+                    ip_sla_policy_tenant = !contains(try(local.tenant_shared_policies[tenant.name].ip_sla_policies, []), next_hop.ip_sla_policy) && contains(try(local.tenant_shared_policies["common"].ip_sla_policies, []), next_hop.ip_sla_policy) ? "common" : tenant.name
                   } if try(next_hop.ip_sla_policy, null) != null
                 ]
               ]
@@ -4147,14 +4164,15 @@ locals {
             for node in try(l3out.nodes, []) : [
               for static_route in try(node.static_routes, []) : [
                 for next_hop in try(static_route.next_hops, []) : {
-                  key            = format("%s/%s_%s", tenant.name, "${l3out.vrf}${local.defaults.apic.tenants.vrfs.name_suffix}", next_hop.ip)
-                  tenant         = tenant.name
-                  name           = try("${l3out.vrf}${local.defaults.apic.tenants.vrfs.name_suffix}_${next_hop.ip}", null)
-                  description    = try("Generated by l3out: ${l3out.name}${local.defaults.apic.tenants.l3outs.name_suffix}, node: ${node.node_id}", "")
-                  destination_ip = try(next_hop.ip, null)
-                  scope_type     = "l3out"
-                  scope          = try("${l3out.name}${local.defaults.apic.tenants.l3outs.name_suffix}", "")
-                  ip_sla_policy  = try("${next_hop.ip_sla_policy}${local.defaults.apic.tenants.policies.ip_sla_policies.name_suffix}", null)
+                  key                  = format("%s/%s_%s", tenant.name, "${l3out.vrf}${local.defaults.apic.tenants.vrfs.name_suffix}", next_hop.ip)
+                  tenant               = tenant.name
+                  name                 = try("${l3out.vrf}${local.defaults.apic.tenants.vrfs.name_suffix}_${next_hop.ip}", null)
+                  description          = try("Generated by l3out: ${l3out.name}${local.defaults.apic.tenants.l3outs.name_suffix}, node: ${node.node_id}", "")
+                  destination_ip       = try(next_hop.ip, null)
+                  scope_type           = "l3out"
+                  scope                = try("${l3out.name}${local.defaults.apic.tenants.l3outs.name_suffix}", "")
+                  ip_sla_policy        = try("${next_hop.ip_sla_policy}${local.defaults.apic.tenants.policies.ip_sla_policies.name_suffix}", null)
+                  ip_sla_policy_tenant = !contains(try(local.tenant_shared_policies[tenant.name].ip_sla_policies, []), next_hop.ip_sla_policy) && contains(try(local.tenant_shared_policies["common"].ip_sla_policies, []), next_hop.ip_sla_policy) ? "common" : tenant.name
                 } if try(next_hop.ip_sla_policy, null) != null
               ]
             ]
@@ -4176,14 +4194,15 @@ locals {
 module "aci_track_member" {
   source = "./modules/terraform-aci-track-member"
 
-  for_each       = { for member in local.track_members : member.key => member if local.modules.aci_track_member && var.manage_tenants }
-  tenant         = each.value.tenant
-  name           = each.value.name
-  description    = each.value.description
-  destination_ip = each.value.destination_ip
-  scope_type     = each.value.scope_type
-  scope          = each.value.scope
-  ip_sla_policy  = each.value.ip_sla_policy
+  for_each             = { for member in local.track_members : member.key => member if local.modules.aci_track_member && var.manage_tenants }
+  tenant               = each.value.tenant
+  name                 = each.value.name
+  description          = each.value.description
+  destination_ip       = each.value.destination_ip
+  scope_type           = each.value.scope_type
+  scope                = each.value.scope
+  ip_sla_policy        = each.value.ip_sla_policy
+  ip_sla_policy_tenant = each.value.ip_sla_policy_tenant
 
   depends_on = [
     module.aci_tenant,
