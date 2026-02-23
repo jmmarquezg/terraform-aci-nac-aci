@@ -3626,7 +3626,7 @@ locals {
         resilient_hashing      = try(policy.resilient_hashing, local.defaults.apic.tenants.services.redirect_policies.resilient_hashing)
         threshold_down_action  = try(policy.threshold_down_action, local.defaults.apic.tenants.services.redirect_policies.threshold_down_action)
         ip_sla_policy          = try("${policy.ip_sla_policy}${local.defaults.apic.tenants.policies.ip_sla_policies.name_suffix}", "")
-        ip_sla_policy_tenant   = !contains(try(local.tenant_shared_policies[tenant.name].ip_sla_policies, []), policy.ip_sla_policy) && contains(try(local.tenant_shared_policies["common"].ip_sla_policies, []), policy.ip_sla_policy) ? "common" : tenant.name
+        ip_sla_policy_tenant   = try(policy.ip_sla_policy, null) != null ? (!contains(try(local.tenant_shared_policies[tenant.name].ip_sla_policies, []), policy.ip_sla_policy) && contains(try(local.tenant_shared_policies["common"].ip_sla_policies, []), policy.ip_sla_policy) ? "common" : tenant.name) : tenant.name
         redirect_backup_policy = try("${policy.redirect_backup_policy}${local.defaults.apic.tenants.services.redirect_backup_policies.name_suffix}", "")
         rewrite_source_mac     = try(policy.rewrite_source_mac, null)
         l3_destinations = [for dest in try(policy.l3_destinations, []) : {
